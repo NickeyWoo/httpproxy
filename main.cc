@@ -37,6 +37,8 @@ struct clientinfo {
     tunnel dest;
     int destfd;
 
+    pollfd evs[2];
+
     bool post;
     std::string host;
     std::string url;
@@ -53,6 +55,26 @@ struct clientinfo {
         curl_headers(nullptr)
     {
         bzero(&addr, sizeof(sockaddr_in));
+        bzero(evs, sizeof(pollfd) * 2);
+    }
+
+    pollfd* events()
+    {
+        evs[0].fd = fd;
+        evs[0].events = POLLIN;
+
+        if(destfd != -1)
+        {
+            evs[1].fd = destfd;
+            evs[1].events = POLLIN;
+        }
+
+        return evs;
+    }
+
+    int evlen()
+    {
+        return (destfd != -1)?2:1;
     }
 
     char* str(const pollfd& ev);
@@ -62,7 +84,6 @@ struct clientinfo {
 
 struct _opt {
     bool verbose;
-    std::unordered_map<int, std::shared_ptr<clientinfo>> fdmap;
 
     _opt() : 
         verbose(false)
@@ -83,22 +104,12 @@ char* clientinfo::str(const int evfd)
     return buff;
 }
 
-char* clientinfo::str(const pollfd& ev)
-{
-    return str(ev.fd);
-}
-
 void clientinfo::close()
 {
     ::close(fd);
 
     if(destfd != -1)
-    {
         ::close(destfd);
-        g_opt.fdmap.erase(destfd);
-    }
-
-    g_opt.fdmap.erase(fd);
 }
 
 size_t curl_write_func(char* ptr, size_t size, size_t nmemb, void* userdata)
@@ -111,7 +122,7 @@ size_t curl_write_func(char* ptr, size_t size, size_t nmemb, void* userdata)
     return realsize;
 }
 
-int process_http_request(std::shared_ptr<clientinfo> cli, char* request, char** body)
+int process_http_request(clientinfo* cli, char* request, char** body)
 {
 /*
  * CONNECT youtube.com:443 HTTP/1.1
@@ -197,8 +208,7 @@ int process_http_request(std::shared_ptr<clientinfo> cli, char* request, char** 
             if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_WRITEFUNCTION, curl_write_func))
                 return -1;
 
-            clientinfo* client_ptr = cli.get();
-            if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_WRITEDATA, client_ptr))
+            if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_WRITEDATA, cli))
                 return -1;
         }
         else if(cli->curl != nullptr)
@@ -224,7 +234,7 @@ int process_http_request(std::shared_ptr<clientinfo> cli, char* request, char** 
     return 0;
 }
 
-int tunnel_connect(const pollfd& ev, ::std::shared_ptr<clientinfo> cli,
+int tunnel_connect(int evfd, clientinfo* cli,
                    char* cachebuf, ssize_t rc, char* body)
 {
     size_t headlen = body - cachebuf;
@@ -232,32 +242,31 @@ int tunnel_connect(const pollfd& ev, ::std::shared_ptr<clientinfo> cli,
 
     if(cli->dest.dest.empty())
     {
-        fprintf(stderr, "ERR | %s parse proxy request fail: %s\n", cli->str(ev), cachebuf);
+        fprintf(stderr, "ERR | %s parse proxy request fail: \"%s\"\n", 
+                cli->str(evfd), cachebuf);
         cli->close();
-        return -1;
+        return 0;
     }
 
     g_opt.verbose && fprintf(stderr, "INF | %s connect to [%s:%d] ...\n", 
-                             cli->str(ev), cli->dest.dest.c_str(), cli->dest.port);
+                             cli->str(evfd), cli->dest.dest.c_str(), cli->dest.port);
 
     cli->destfd = socket(PF_INET, SOCK_STREAM, 0);
     if(cli->destfd == -1)
     {
         fprintf(stderr, "ERR | %s create dest fd fail, errno:%d -> %s\n", 
-                cli->str(ev), errno, strerror(errno));
+                cli->str(evfd), errno, strerror(errno));
         cli->close();
-        return -1;
+        return 0;
     }
-
-    g_opt.fdmap[cli->destfd] = cli;
 
     hostent* host = gethostbyname(cli->dest.dest.c_str());
     if(NULL == host || host->h_addr_list[0] == nullptr)
     {
         fprintf(stderr, "ERR | %s get host(%s) fail, errno:%d -> %s\n", 
-                cli->str(ev), cli->dest.dest.c_str(), errno, strerror(errno));
+                cli->str(evfd), cli->dest.dest.c_str(), errno, strerror(errno));
         cli->close();
-        return -1;
+        return 0;
     }
 
     sockaddr_in destaddr;
@@ -267,14 +276,14 @@ int tunnel_connect(const pollfd& ev, ::std::shared_ptr<clientinfo> cli,
 
     if(-1 == connect(cli->destfd, (const sockaddr*)&destaddr, sizeof(sockaddr_in)))
     {
-        fprintf(stderr, "ERR | %s connect to ", cli->str(ev));
+        fprintf(stderr, "ERR | %s connect to ", cli->str(evfd));
         fprintf(stderr, "%s fail, errno:%d -> %s\n", 
                 cli->str(cli->destfd), errno, strerror(errno));
         cli->close();
-        return -1;
+        return 0;
     }
 
-    g_opt.verbose && fprintf(stderr, "INF | %s connect to ", cli->str(ev));
+    g_opt.verbose && fprintf(stderr, "INF | %s connect to ", cli->str(evfd));
     g_opt.verbose && fprintf(stderr, "%s success\n", cli->str(cli->destfd));
 
     if(bodylen > 0)
@@ -282,15 +291,15 @@ int tunnel_connect(const pollfd& ev, ::std::shared_ptr<clientinfo> cli,
         ssize_t sc = send(cli->destfd, body, bodylen, 0);
         if(-1 == sc)
         {
-            fprintf(stderr, "ERR | %s send to ", cli->str(ev));
+            fprintf(stderr, "ERR | %s send to ", cli->str(evfd));
             fprintf(stderr, "%s fail, errno:%d -> %s\n", 
                     cli->str(cli->destfd), errno, strerror(errno));
             cli->close();
-            return -1;
+            return 0;
         }
 
         g_opt.verbose && fprintf(stderr, "INF | %s send(rc:%ld, head:%ld, body:%ld, sc:%ld) to ", 
-                                 cli->str(ev), rc, headlen, bodylen, sc);
+                                 cli->str(evfd), rc, headlen, bodylen, sc);
         g_opt.verbose && fprintf(stderr, "%s\n", cli->str(cli->destfd));
     }
 
@@ -301,13 +310,13 @@ int tunnel_connect(const pollfd& ev, ::std::shared_ptr<clientinfo> cli,
         fprintf(stderr, "ERR | resp to %s connection established fail, errno:%d -> %s\n", 
                 cli->str(cli->fd), errno, strerror(errno));
         cli->close();
-        return -1;
+        return 0;
     }
 
-    return 0;
+    return 1;
 }
 
-int proxy_url(const pollfd& ev, std::shared_ptr<clientinfo> cli,
+int proxy_url(int evfd, clientinfo* cli,
               char* cachebuf, ssize_t rc, char* body)
 {
     if(cli->post)
@@ -317,15 +326,17 @@ int proxy_url(const pollfd& ev, std::shared_ptr<clientinfo> cli,
         if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_POSTFIELDSIZE, rc - (body - cachebuf)))
         {
             fprintf(stderr, "ERR | %s set CURLOPT_POSTFIELDSIZE fail <- %s\n", 
-                    cli->str(ev), cli->url.c_str());
-            return -1;
+                    cli->str(evfd), cli->url.c_str());
+            cli->close();
+            return 0;
         }
 
         if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_POSTFIELDS, body))
         {
             fprintf(stderr, "ERR | %s set CURLOPT_POSTFIELDS fail <- %s\n", 
-                    cli->str(ev), cli->url.c_str());
-            return -1;
+                    cli->str(evfd), cli->url.c_str());
+            cli->close();
+            return 0;
         }
     }
 
@@ -342,125 +353,146 @@ int proxy_url(const pollfd& ev, std::shared_ptr<clientinfo> cli,
     if(CURLE_OK != curl_easy_setopt(cli->curl, CURLOPT_URL, cli->url.c_str()))
     {
         fprintf(stderr, "ERR | %s set CURLOPT_URL fail <- %s\n", 
-                cli->str(ev), cli->url.c_str());
-        return -1;
+                cli->str(evfd), cli->url.c_str());
+        cli->close();
+        return 0;
     }
 
     g_opt.verbose && fprintf(stderr, "INF | %s %s -> %s ...\n", 
                              cli->post?"POST":"GET",
-                             cli->str(ev), cli->url.c_str());
+                             cli->str(evfd), cli->url.c_str());
 
     CURLcode retcode = curl_easy_perform(cli->curl);
     if(CURLE_OK != retcode) 
     {
-        fprintf(stderr, "ERR | %s download fail <- %s\n", cli->str(ev), cli->url.c_str());
-        return -1;
+        fprintf(stderr, "ERR | %s download fail <- %s\n", 
+                cli->str(evfd), cli->url.c_str());
+        cli->close();
+        return 0;
     }
 
     long http_code = 0;
     retcode = curl_easy_getinfo(cli->curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     g_opt.verbose && fprintf(stderr, "INF | %s http_code:%ld <- %s ...\n", 
-                             cli->str(ev), http_code, cli->url.c_str());
+                             cli->str(evfd), http_code, cli->url.c_str());
 
     ssize_t sc = send(cli->fd, cli->resp4url.c_str(), cli->resp4url.size(), 0);
     if(-1 == sc)
     {
         fprintf(stderr, "ERR | %s resp to %s fail, errno:%d -> %s\n", 
-                cli->url.c_str(), cli->str(cli->fd), errno, strerror(errno));
+                cli->url.c_str(), cli->str(evfd), 
+                errno, strerror(errno));
         cli->close();
-        return -1;
+        return 0;
     }
 
-    return 0;
+    return 1;
 }
 
-int recv_client(const pollfd& ev)
+int recv_client(int evfd, clientinfo* cli)
 {
-    auto iter = g_opt.fdmap.find(ev.fd);
-    if(iter == g_opt.fdmap.end())
-    {
-        fprintf(stderr, "ERR | not found client fd(%d)\n", ev.fd);
-        close(ev.fd);
-        return -1;
-    }
-
-    ::std::shared_ptr<clientinfo> cli = iter->second;
-
     static std::string cachebuf(4096, 0);
-    ssize_t rc = recv(ev.fd, (char*)cachebuf.data(), 4096, 0);
+
+    ssize_t rc = recv(evfd, (char*)cachebuf.data(), 4096, 0);
     if(-1 == rc)
     {
         if(errno != ECONNRESET)
         {
             fprintf(stderr, "ERR | %s recv fail, errno:%d -> %s\n", 
-                    cli->str(ev), errno, strerror(errno));
+                    cli->str(evfd), errno, strerror(errno));
         }
-
         cli->close();
-        return -1;
+        return 0;
     }
     else if(0 == rc)
     {
-        g_opt.verbose && fprintf(stderr, "INF | %s disconnected\n", cli->str(ev));
+        g_opt.verbose && fprintf(stderr, "INF | %s disconnected\n", cli->str(evfd));
         cli->close();
         return 0;
     }
 
-    g_opt.verbose && fprintf(stderr, "INF | %s recv(rc:%ld)\n", cli->str(ev), rc);
+    g_opt.verbose && fprintf(stderr, "INF | %s recv(rc:%ld)\n", cli->str(evfd), rc);
 
     if(cli->destfd > 0)
     {
-        int fd = cli->destfd;
-        if(ev.fd == cli->destfd)
-            fd = cli->fd;
-
-        ssize_t sc = send(fd, cachebuf.data(), rc, 0);
+        int tofd = (evfd==cli->destfd)?cli->fd:cli->destfd;
+        ssize_t sc = send(tofd, cachebuf.data(), rc, 0);
         if(-1 == sc)
         {
-            fprintf(stderr, "ERR | %s send to ", cli->str(ev));
-            fprintf(stderr, "%s fail, errno:%d -> %s\n", cli->str(fd),
+            fprintf(stderr, "ERR | %s send to ", cli->str(evfd));
+            fprintf(stderr, "%s fail, errno:%d -> %s\n", cli->str(tofd),
                     errno, strerror(errno));
         }
         
-        g_opt.verbose && fprintf(stderr, "INF | %s send(rc:", cli->str(ev));
-        g_opt.verbose && fprintf(stderr, "%ld, sc:%ld) to %s\n", rc, sc, cli->str(fd));
-
-        return 0;
+        g_opt.verbose && fprintf(stderr, "INF | %s send(rc:", cli->str(evfd));
+        g_opt.verbose && fprintf(stderr, "%ld, sc:%ld) to %s\n", rc, sc, cli->str(tofd));
+        return 1;
     }
 
     // new connect request
     char* body = nullptr;
     if(-1 == process_http_request(cli, (char*)cachebuf.data(), &body))
     {
-        fprintf(stderr, "ERR | %s parse http request fail\n", cli->str(ev));
+        fprintf(stderr, "ERR | %s parse http request fail\n", cli->str(evfd));
         cli->close();
-        return -1;
+        return 0;
     }
 
     if(cli->url.empty())
-        return tunnel_connect(ev, cli, (char*)cachebuf.data(), rc, body);
+        return tunnel_connect(evfd, cli, (char*)cachebuf.data(), rc, body);
 
-    return proxy_url(ev, cli, (char*)cachebuf.data(), rc, body);
+    return proxy_url(evfd, cli, (char*)cachebuf.data(), rc, body);
 }
 
 int accept_client(int listenfd)
 {
-    std::shared_ptr<clientinfo> cli(new clientinfo);
+    clientinfo cli;
 
     socklen_t cliaddrlen;
-    cli->fd = accept(listenfd, (sockaddr*)&cli->addr, &cliaddrlen);
-    if(-1 == cli->fd)
+    cli.fd = accept(listenfd, (sockaddr*)&cli.addr, &cliaddrlen);
+    if(-1 == cli.fd)
     {
-        fprintf(stderr, "ERR | accept client fail, errno:%d -> %s\n", errno, strerror(errno));
+        fprintf(stderr, "ERR | accept client fail, errno:%d -> %s\n", 
+                errno, strerror(errno));
         return -1;
     }
 
     g_opt.verbose && fprintf(stderr, "INF | client(fd:%d)[%s:%d] connected\n", 
-                             cli->fd, inet_ntoa(cli->addr.sin_addr), 
-                             ntohs(cli->addr.sin_port));
+                             cli.fd, inet_ntoa(cli.addr.sin_addr), 
+                             ntohs(cli.addr.sin_port));
 
-    g_opt.fdmap[cli->fd] = cli;
+    pid_t pid = fork();
+    if(-1 == pid)
+    {
+        fprintf(stderr, "ERR | create child process fail, errno:%d -> %s\n", 
+                errno, strerror(errno));
+        return -1;
+    }
+    else if(pid > 0)
+    {
+        // parent process;
+        close(cli.fd);
+        return 0;
+    }
+
+    // child process;
+    while(poll(cli.events(), cli.evlen(), -1) > 0)
+    {
+        for(int i=0; i<cli.evlen(); ++i)
+        {
+            if((cli.evs[i].revents & POLLIN) != POLLIN)
+                continue;
+
+            g_opt.verbose && fprintf(stderr, "INF | event fd:%d found event:%x\n", 
+                                     cli.evs[i].fd, cli.evs[i].revents);
+
+            if(0 == recv_client(cli.evs[i].fd, &cli))
+                exit(0);
+        }
+    }
+
+    exit(0);
     return 0;
 }
 
@@ -479,6 +511,8 @@ int main(int argc, char* argv[])
             return 0;
         }
     }
+
+    signal(SIGCHLD, SIG_IGN);
 
     int listenfd = socket(PF_INET, SOCK_STREAM, 0);
     if(listenfd == -1)
@@ -513,40 +547,14 @@ int main(int argc, char* argv[])
 
     g_opt.verbose && fprintf(stderr, "INF | [0.0.0.0:8080] listening ...\n");
 
-    std::vector<pollfd> pollvec;
-    pollvec.reserve(4096);
-    pollvec.push_back({listenfd, POLLIN, 0});
+    pollfd ev;
+    ev.fd = listenfd;
+    ev.events = POLLIN;
 
-    uint64_t seq = 0;
-    int ready = 0;
-    while((ready = poll(pollvec.data(), pollvec.size(), -1)) > 0)
-    {
-        ++seq;
-
-        g_opt.verbose && fprintf(stderr, "INF | ------------------------ seq[%llu][ready:%d][size:%lu] ---------------------------\n", 
-                                 seq, ready, pollvec.size());
-
-        for(int i=0; i<pollvec.size(); ++i)
-        {
-            pollfd& ev = pollvec.at(i);
-            if((ev.revents & POLLIN) != POLLIN) 
-                continue;
-
-            if(ev.fd == listenfd)
-                accept_client(listenfd);
-            else
-                recv_client(ev);
-        }
-
-        pollvec.clear();
-
-        pollvec.push_back({listenfd, POLLIN, 0});
-        for(auto iter=g_opt.fdmap.begin(); iter!=g_opt.fdmap.end(); ++iter)
-            pollvec.push_back({iter->first, POLLIN, 0});
-    }
+    while(poll(&ev, 1, -1) > 0)
+        accept_client(listenfd);
 
     close(listenfd);
-
     return 0;
 }
 
